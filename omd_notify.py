@@ -15,6 +15,7 @@ At least one of NTFY_TOPIC / DISCORD_WEBHOOK_URL is required.
 """
 import json
 import os
+import signal
 import string
 import sys
 import time
@@ -29,6 +30,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 FORGET_AFTER = 6 * 3600   # seen again after 6h of silence = new flight
 MAX_CHUNK_CHARS = 7000    # API limit is 8000 characters per request
 MAX_CHUNK_ITEMS = 800     # API limit is 1000 callsigns per request
+TIME_BUDGET = 120         # stop starting new batches after this many seconds
 
 
 def candidates(prefix=PREFIX, max_number=MAX_NUMBER):
@@ -50,27 +52,37 @@ def chunk(items, max_chars=MAX_CHUNK_CHARS, max_items=MAX_CHUNK_ITEMS):
     return out
 
 
-def http(url, data=None, headers=None, timeout=20):
+def _on_alarm(signum, frame):
+    raise TimeoutError("request exceeded its hard time limit")
+
+
+def http(url, data=None, headers=None, timeout=15):
+    """HTTP request that can never hang: socket timeout plus a hard alarm."""
     h = {"User-Agent": UA}
     h.update(headers or {})
     req = urllib.request.Request(url, data=data, headers=h)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(timeout + 10)  # covers slow-trickle responses the socket timeout misses
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    finally:
+        signal.alarm(0)
 
 
 def fetch(callsigns):
     url = API + ",".join(callsigns)
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             return json.loads(http(url)).get("ac", [])
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < 2:
+            if e.code == 429 and attempt < 1:
                 time.sleep(5)
                 continue
             raise
-        except (urllib.error.URLError, TimeoutError):
-            if attempt < 2:
-                time.sleep(3)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt < 1:
+                time.sleep(2)
                 continue
             raise
     return []
@@ -163,17 +175,28 @@ def main():
     now = time.time()
     state = load_state()
     found, failures, chunks = {}, 0, chunk(candidates())
+    start = time.time()
     for i, c in enumerate(chunks):
+        if time.time() - start > TIME_BUDGET:
+            failures += len(chunks) - i
+            print(f"Time budget of {TIME_BUDGET}s used up; skipping {len(chunks) - i} batches.",
+                  file=sys.stderr, flush=True)
+            break
         if i:
             time.sleep(1.1)  # API limit: 1 request/second
+        t0 = time.time()
         try:
-            for ac in fetch(c):
+            acs = fetch(c)
+            for ac in acs:
                 cs = (ac.get("flight") or "").strip().upper()
                 if cs.startswith(PREFIX) and ac.get("hex"):
                     found[f"{ac['hex']}:{cs}"] = ac
+            print(f"batch {i + 1}/{len(chunks)} ok in {time.time() - t0:.1f}s ({len(acs)} aircraft)",
+                  flush=True)
         except Exception as e:  # noqa: BLE001
             failures += 1
-            print(f"request {i + 1}/{len(chunks)} failed: {e}", file=sys.stderr)
+            print(f"batch {i + 1}/{len(chunks)} FAILED after {time.time() - t0:.1f}s: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
     if failures == len(chunks):
         print("All requests failed; keeping old state.", file=sys.stderr)
@@ -198,4 +221,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
