@@ -35,7 +35,7 @@ jobs:
 
       - name: Check for OMD flights
         env:
-          NTFY_TOPIC: ${{ omd-watch-k8f3q92x }}
+          NTFY_TOPIC: ${{ NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }} }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TEST: ${{ inputs.test }}
         run: python3 omd_notify.py
