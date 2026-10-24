@@ -1,1 +1,42 @@
+name: OMD watcher
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes (GitHub may delay runs a bit)
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test notification only"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: omd-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Remember which flights we already notified about
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: omd-state-${{ github.run_id }}
+          restore-keys: |
+            omd-state-
+
+      - name: Check for OMD flights
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TEST: ${{ inputs.test }}
+        run: python3 omd_notify.py
 
