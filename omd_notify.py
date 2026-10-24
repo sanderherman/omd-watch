@@ -1,91 +1,82 @@
 #!/usr/bin/env python3
 """Notify when aircraft with a given callsign prefix (default: OMD, Nomadic
-Aviation Group) show up on ADS-B, using the free airplanes.live API.
+Aviation Group) show up on ADS-B, using the free OpenSky Network API.
 
-airplanes.live only matches EXACT callsigns, so we ask for every plausible
-callsign (OMD1 ... OMD999, OMD1A ... OMD99Z) in a few batched requests.
+One request downloads every aircraft OpenSky currently sees; we then pick out
+the ones whose callsign starts with the prefix.
 
 Settings come from environment variables:
-  NTFY_TOPIC           ntfy.sh topic name (phone push)      [optional]
-  DISCORD_WEBHOOK_URL  Discord webhook URL                  [optional]
-  CALLSIGN_PREFIX      default OMD
-  MAX_NUMBER           highest flight number to check, default 999
-  TEST                 set to "true" to just send a test notification
+  OPENSKY_CLIENT_ID      OpenSky API client id        [required]
+  OPENSKY_CLIENT_SECRET  OpenSky API client secret    [required]
+  NTFY_TOPIC             ntfy.sh topic name (phone)   [optional]
+  DISCORD_WEBHOOK_URL    Discord webhook URL          [optional]
+  CALLSIGN_PREFIX        default OMD
+  TEST                   "true" = just send a test notification
 At least one of NTFY_TOPIC / DISCORD_WEBHOOK_URL is required.
 """
 import json
 import os
 import signal
-import string
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
-API = "https://api.airplanes.live/v2/callsign/"
-UA = "omd-notify/1.0 (personal ADS-B callsign watcher)"
+TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+STATES_URL = "https://opensky-network.org/api/states/all"
+UA = "omd-notify/2.0 (personal ADS-B callsign watcher)"
 PREFIX = os.environ.get("CALLSIGN_PREFIX", "OMD").strip().upper()
-MAX_NUMBER = int(os.environ.get("MAX_NUMBER", "999"))
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 FORGET_AFTER = 6 * 3600   # seen again after 6h of silence = new flight
-MAX_CHUNK_CHARS = 7000    # API limit is 8000 characters per request
-MAX_CHUNK_ITEMS = 800     # API limit is 1000 callsigns per request
-TIME_BUDGET = 120         # stop starting new batches after this many seconds
-
-
-def candidates(prefix=PREFIX, max_number=MAX_NUMBER):
-    nums = [f"{prefix}{n}" for n in range(1, max_number + 1)]
-    letters = [f"{prefix}{n}{c}" for n in range(1, 100) for c in string.ascii_uppercase]
-    return nums + letters
-
-
-def chunk(items, max_chars=MAX_CHUNK_CHARS, max_items=MAX_CHUNK_ITEMS):
-    out, cur, size = [], [], 0
-    for it in items:
-        if cur and (size + len(it) + 1 > max_chars or len(cur) >= max_items):
-            out.append(cur)
-            cur, size = [], 0
-        cur.append(it)
-        size += len(it) + 1
-    if cur:
-        out.append(cur)
-    return out
 
 
 def _on_alarm(signum, frame):
     raise TimeoutError("request exceeded its hard time limit")
 
 
-def http(url, data=None, headers=None, timeout=15):
-    """HTTP request that can never hang: socket timeout plus a hard alarm."""
+def http(url, data=None, headers=None, timeout=30):
+    """HTTP request that can never hang. Returns (body_bytes, headers)."""
     h = {"User-Agent": UA}
     h.update(headers or {})
     req = urllib.request.Request(url, data=data, headers=h)
     signal.signal(signal.SIGALRM, _on_alarm)
-    signal.alarm(timeout + 10)  # covers slow-trickle responses the socket timeout misses
+    signal.alarm(timeout + 15)  # catches slow-trickle responses the socket timeout misses
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read()
+            return r.read(), r.headers
     finally:
         signal.alarm(0)
 
 
-def fetch(callsigns):
-    url = API + ",".join(callsigns)
-    for attempt in range(2):
-        try:
-            return json.loads(http(url)).get("ac", [])
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < 1:
-                time.sleep(5)
-                continue
-            raise
-        except (urllib.error.URLError, TimeoutError, OSError):
-            if attempt < 1:
-                time.sleep(2)
-                continue
-            raise
-    return []
+def get_token(client_id, client_secret):
+    data = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }).encode()
+    body, _ = http(TOKEN_URL, data=data,
+                   headers={"Content-Type": "application/x-www-form-urlencoded"})
+    return json.loads(body)["access_token"]
+
+
+def fetch_states(token):
+    """Return (list_of_state_vectors, remaining_credits_or_None)."""
+    body, hdrs = http(STATES_URL, headers={"Authorization": f"Bearer {token}"})
+    return json.loads(body).get("states") or [], hdrs.get("X-Rate-Limit-Remaining")
+
+
+def to_ac(s):
+    """Convert an OpenSky state vector (a list) to a simple dict."""
+    alt_m, vel = s[7], s[9]
+    return {
+        "hex": s[0],
+        "flight": (s[1] or "").strip().upper(),
+        "lat": s[6],
+        "lon": s[5],
+        "alt_baro": "ground" if s[8] else (round(alt_m * 3.28084) if alt_m is not None else None),
+        "gs": round(vel * 1.94384) if vel is not None else None,
+    }
 
 
 def describe(ac):
@@ -100,10 +91,7 @@ def describe(ac):
     gs = ac.get("gs")
     if gs and alt != "ground":
         status += f", {int(gs)} kt"
-    lines = [f"{cs} ({status})"]
-    ident = " / ".join(x for x in (ac.get("r"), ac.get("t"), ac.get("desc")) if x)
-    if ident:
-        lines.append(ident)
+    lines = [f"{cs} ({status})", f"Transponder: {ac.get('hex', '').upper()}"]
     if ac.get("lat") is not None and ac.get("lon") is not None:
         lines.append(f"Position: {ac['lat']:.2f}, {ac['lon']:.2f}")
     link = f"https://globe.airplanes.live/?icao={ac.get('hex', '')}"
@@ -115,6 +103,7 @@ def send_ntfy(topic, title, body, link):
         f"https://ntfy.sh/{topic}",
         data=body.encode("utf-8"),
         headers={"Title": title, "Click": link, "Tags": "airplane"},
+        timeout=15,
     )
 
 
@@ -124,6 +113,7 @@ def send_discord(webhook, title, body, link):
         webhook,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
+        timeout=15,
     )
 
 
@@ -172,35 +162,42 @@ def main():
         print("Test sent." if ok else "Test failed.")
         return 0 if ok else 1
 
+    cid = os.environ.get("OPENSKY_CLIENT_ID", "").strip()
+    csec = os.environ.get("OPENSKY_CLIENT_SECRET", "").strip()
+    if not (cid and csec):
+        print("OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET secrets are not set.", file=sys.stderr)
+        return 1
+
+    # 1) log in, 2) download all aircraft (one retry on network trouble)
+    states, remaining = None, None
+    for attempt in range(2):
+        try:
+            token = get_token(cid, csec)
+            t0 = time.time()
+            states, remaining = fetch_states(token)
+            print(f"OpenSky OK in {time.time() - t0:.1f}s: {len(states)} aircraft worldwide, "
+                  f"credits left today: {remaining}", flush=True)
+            break
+        except urllib.error.HTTPError as e:
+            print(f"OpenSky HTTP error {e.code}: {e.reason}", file=sys.stderr, flush=True)
+            if e.code in (401, 403, 429):
+                break  # retrying won't help (bad credentials / out of credits / blocked)
+        except Exception as e:  # noqa: BLE001
+            print(f"OpenSky request failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        if attempt == 0:
+            time.sleep(3)
+    if states is None:
+        print("Could not get data; keeping old state.", file=sys.stderr)
+        return 1
+
     now = time.time()
     state = load_state()
-    found, failures, chunks = {}, 0, chunk(candidates())
-    start = time.time()
-    for i, c in enumerate(chunks):
-        if time.time() - start > TIME_BUDGET:
-            failures += len(chunks) - i
-            print(f"Time budget of {TIME_BUDGET}s used up; skipping {len(chunks) - i} batches.",
-                  file=sys.stderr, flush=True)
-            break
-        if i:
-            time.sleep(1.1)  # API limit: 1 request/second
-        t0 = time.time()
-        try:
-            acs = fetch(c)
-            for ac in acs:
-                cs = (ac.get("flight") or "").strip().upper()
-                if cs.startswith(PREFIX) and ac.get("hex"):
-                    found[f"{ac['hex']}:{cs}"] = ac
-            print(f"batch {i + 1}/{len(chunks)} ok in {time.time() - t0:.1f}s ({len(acs)} aircraft)",
-                  flush=True)
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"batch {i + 1}/{len(chunks)} FAILED after {time.time() - t0:.1f}s: "
-                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-
-    if failures == len(chunks):
-        print("All requests failed; keeping old state.", file=sys.stderr)
-        return 1
+    found = {}
+    for s in states:
+        cs = (s[1] or "").strip().upper()
+        if cs.startswith(PREFIX):
+            ac = to_ac(s)
+            found[f"{ac['hex']}:{cs}"] = ac
 
     sent = 0
     for key, ac in found.items():
@@ -215,7 +212,7 @@ def main():
 
     state = {k: v for k, v in state.items() if now - v < 7 * 86400}
     save_state(state)
-    print(f"Checked {len(chunks)} batches, {len(found)} aircraft, {sent} notifications.")
+    print(f"{len(found)} {PREFIX} aircraft right now, {sent} notifications sent.")
     return 0
 
 
