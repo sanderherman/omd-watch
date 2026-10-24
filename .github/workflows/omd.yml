@@ -2,7 +2,7 @@ name: OMD watcher
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes (GitHub may delay runs a bit)
+    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
       test:
@@ -24,7 +24,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Remember which flights we already notified about
       - name: Restore state
         uses: actions/cache@v4
         with:
@@ -35,8 +34,7 @@ jobs:
 
       - name: Check for OMD flights
         env:
-          NTFY_TOPIC: ${{ NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }} }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TEST: ${{ inputs.test }}
         run: python3 omd_notify.py
-
