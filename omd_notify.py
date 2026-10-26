@@ -16,6 +16,7 @@ At least one of NTFY_TOPIC / DISCORD_WEBHOOK_URL is required.
 """
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -29,6 +30,16 @@ UA = "omd-notify/2.0 (personal ADS-B callsign watcher)"
 PREFIX = os.environ.get("CALLSIGN_PREFIX", "OMD").strip().upper()
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 FORGET_AFTER = 6 * 3600   # seen again after 6h of silence = new flight
+
+
+# Prefix + 1-4 digits + optional 1-2 letters (e.g. OMD123, OMD7A).
+# Deliberately NOT a plain "starts with": registration-style callsigns
+# such as OMDYE (aircraft OM-DYE) must not match.
+CALLSIGN_RE = re.compile(rf"^{re.escape(PREFIX)}\d{{1,4}}[A-Z]{{0,2}}$")
+
+
+def is_match(callsign):
+    return bool(CALLSIGN_RE.match(callsign))
 
 
 def _on_alarm(signum, frame):
@@ -195,7 +206,7 @@ def main():
     found = {}
     for s in states:
         cs = (s[1] or "").strip().upper()
-        if cs.startswith(PREFIX):
+        if is_match(cs):
             ac = to_ac(s)
             found[f"{ac['hex']}:{cs}"] = ac
 
